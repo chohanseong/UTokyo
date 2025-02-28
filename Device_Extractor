@@ -1,0 +1,140 @@
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+
+# --- 소수점 3자리까지 ---
+pd.set_option('display.float_format', lambda x: f"{x:.4f}")
+
+# --- 파일 경로 설정 ---
+file_path = "nMOS.xlsx"  # 엑셀 파일 (A,B열: Vd=0.05V, C,D열: Vd=1.12V)
+
+# --- 파일 존재 확인 ---
+if not os.path.exists(file_path):
+    print(f"⚠️ 파일을 찾을 수 없습니다: {file_path}")
+    print(f"현재 작업 폴더: {os.getcwd()}")
+    exit()
+
+# --- 파일 로드 ---
+df = pd.read_excel(file_path, engine="openpyxl")
+print("✅ 파일이 정상적으로 로드되었습니다.")
+print(df.head())
+
+# --- 데이터 라벨링 ---
+# Vd = 0.05 V 데이터: A열 (Vg), B열 (Id)
+Vg_05 = df.iloc[:, 0].values.astype(float)
+Id_05 = np.abs(df.iloc[:, 1].values.astype(float))  # 음수를 절댓값 처리
+
+# Vd = 1.12 V 데이터: C열 (Vg), D열 (Id)
+Vg_112 = df.iloc[:, 2].values.astype(float)
+Id_112 = np.abs(df.iloc[:, 3].values.astype(float))  # 음수를 절댓값 처리
+
+# --- 로그 변환 (Id > 0 인 데이터만 사용) ---
+valid_idx_05 = Id_05 > 0
+Vg_05_valid = Vg_05[valid_idx_05]
+logId_05 = np.log10(Id_05[valid_idx_05])
+
+valid_idx_112 = Id_112 > 0
+Vg_112_valid = Vg_112[valid_idx_112]
+logId_112 = np.log10(Id_112[valid_idx_112])
+
+# --- 함수 정의: 로그 스케일 내분법으로 Vth 추출 ---
+def extract_Vth(Vg, logId, target=-7):
+    """
+    Vg와 log10(Id) 데이터를 이용하여, target (예: -7)에 대해
+    인접한 두 점 사이의 linear interpolation으로 Vth를 계산.
+    """
+    for i in range(len(logId) - 1):
+        if (logId[i] - target) * (logId[i+1] - target) <= 0:
+            Vg_low = Vg[i]
+            Vg_high = Vg[i+1]
+            logId_low = logId[i]
+            logId_high = logId[i+1]
+            if logId_high == logId_low:
+                return Vg[i]
+            Vth = Vg_low + (Vg_high - Vg_low) * (target - logId_low) / (logId_high - logId_low)
+            return Vth
+    return None
+
+# --- Vth 추출 ---
+target_log = -7
+Vth_05 = extract_Vth(Vg_05_valid, logId_05, target=target_log)
+Vth_112 = extract_Vth(Vg_112_valid, logId_112, target=target_log)
+
+# --- DIBL 계산 ---
+# DIBL = (Vth@0.05V - Vth@1.12V) / 1.15 * 1000 [mV/V]
+if Vth_05 is not None and Vth_112 is not None:
+    DIBL = abs((Vth_05 - Vth_112) / 1.15 * 1000)
+else:
+    DIBL = None
+
+# --- gm 계산 (Vd = 0.05 V 데이터, raw Id 미분) ---
+gm_values = np.gradient(Id_05, Vg_05)
+max_gm = np.max(np.abs(gm_values))*1e6
+
+# --- 함수 정의: 주어진 target 기준 SS 계산 ---
+def compute_SS(Vg_valid, logId, target):
+    """
+    주어진 Vg_valid, log10(Id) 데이터에서 target 값(예: -7 또는 -8)에 대해,
+    아래쪽(≤ target)에서 가장 가까운 2개와 위쪽(> target)에서 가장 가까운 3개 데이터를 선택한 후
+    선형 회귀를 수행하여 SS (mV/dec)를 계산.
+    """
+    below_indices = np.where(logId <= target)[0]
+    above_indices = np.where(logId > target)[0]
+    
+    if len(below_indices) >= 2:
+        diff_below = np.abs(logId[below_indices] - target)
+        sorted_below = below_indices[np.argsort(diff_below)]
+        selected_below = sorted_below[:2]
+    else:
+        selected_below = below_indices
+
+    if len(above_indices) >= 3:
+        diff_above = np.abs(logId[above_indices] - target)
+        sorted_above = above_indices[np.argsort(diff_above)]
+        selected_above = sorted_above[:3]
+    else:
+        selected_above = above_indices
+
+    indices = np.concatenate((selected_below, selected_above))
+    
+    if len(indices) >= 2:
+        slope, _, _, _, _ = linregress(Vg_valid[indices], logId[indices])
+        return (1 / slope) * 1000  # mV/dec 단위
+    else:
+        return None
+
+# --- SS 계산 ---  
+SS_1E7 = abs(compute_SS(Vg_05_valid, logId_05, target=-7))  # 1E-7 기준
+SS_1E8 = abs(compute_SS(Vg_05_valid, logId_05, target=-8))  # 1E-8 기준
+
+# --- 결과 출력 ---
+results = pd.DataFrame({
+    "Parameter": ["(Vd=0.05V) Vth (V)", "(Vd=1.12V) Vth (V)", "DIBL (mV/V)", "gm max (μS)", "SS 1E-7 (mV/dec)", "SS 1E-8 (mV/dec)"],
+    "Value": [Vth_05, Vth_112, DIBL, max_gm, SS_1E7, SS_1E8]
+})
+print("\n🔹 Extracted Device Parameters (log scale 기준) 🔹")
+print(results.to_string(index=False))
+
+# --- 그래프 시각화  ---
+plt.figure(figsize=(8, 6))
+
+# Vd = 0.05 V 데이터 (파란색)
+plt.plot(Vg_05_valid, logId_05, 'o-', color='blue', label='Vd = 0.05V')
+# target 기준 보조선들
+plt.axhline(y=-7, color='r', linestyle='--', label='Target log(Id)=-7')
+if Vth_05 is not None:
+    plt.axvline(x=Vth_05, color='g', linestyle='--', label=f'Vth (0.05V, target=-7)={Vth_05:.3f} V')
+
+# Vd = 1.2 V 데이터 (빨간색)
+plt.plot(Vg_112_valid, logId_112, 'o-', color='red', label='Vd = 1.2V')
+if Vth_112 is not None:
+    plt.axvline(x=Vth_112, color='g', linestyle='--', label=f'Vth (1.2V, target=-7)={Vth_112:.3f} V')
+
+plt.xlabel("Gate Voltage (V)")
+plt.ylabel("Drain Current*(L/W) (A)")
+plt.title("Vg-Id (Vd = 0.05V and Vd = 1.2V)")
+plt.legend()
+plt.grid(True)
+plt.show()
